@@ -6,10 +6,47 @@ import time
 from datetime import datetime, timedelta
 from gtts import gTTS
 import base64
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # --- CONFIGURATION ---
-DB_FILE = "gym_architect_v8.json"
+# نام دقیق شیتی که در گوگل شیت ساختی
+SHEET_NAME = "gym_database" 
 THEME_IMG_URL = "https://images.unsplash.com/photo-1534438327276-14e5300c3a48?q=80&w=1470&auto=format&fit=crop"
+
+# --- CLOUD DATABASE FUNCTIONS (GOOGLE SHEETS) ---
+def get_google_sheet_client():
+    # اتصال با استفاده از سکرت‌های استریم‌لیت
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds_dict = st.secrets["service_account"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    return client
+
+def load_db():
+    """دانلود دیتابیس از گوگل شیت"""
+    try:
+        client = get_google_sheet_client()
+        sheet = client.open(SHEET_NAME).sheet1
+        # تمام دیتا در سلول A1 ذخیره می‌شود
+        data = sheet.acell('A1').value
+        if not data:
+            return {}
+        return json.loads(data)
+    except Exception as e:
+        # اگر خطا داد (مثلا شیت خالی بود) دیکشنری خالی برگردان
+        return {}
+
+def save_db(data):
+    """آپلود دیتابیس به گوگل شیت"""
+    try:
+        client = get_google_sheet_client()
+        sheet = client.open(SHEET_NAME).sheet1
+        # تبدیل دیتا به متن و ذخیره در A1
+        json_str = json.dumps(data)
+        sheet.update_acell('A1', json_str)
+    except Exception as e:
+        st.error(f"خطا در ذخیره سازی ابری: {e}")
 
 # --- DETAILED EXERCISE LIBRARY ---
 EXERCISE_LIB = {
@@ -154,21 +191,33 @@ def autoplay_audio(text):
 
 def get_weekly_status(history, total_days_in_plan):
     today = datetime.now().date()
+    # اگر تاریخ عضویت به فرمت رشته است، تبدیل به تاریخ
+    if isinstance(total_days_in_plan, str):
+        try:
+            start_date = datetime.strptime(total_days_in_plan, "%Y-%m-%d").date()
+        except:
+            start_date = today # فال‌بک
+    else:
+        start_date = total_days_in_plan
+
+    days_passed = (today - start_date).days
+    current_week = (days_passed // 7) + 1
+    week_start_day = start_date + timedelta(weeks=current_week-1)
+
     completed_this_week = []
     for log in history:
         try:
             log_date = datetime.strptime(log['date'], "%Y-%m-%d").date()
-            if (today - log_date).days < 7:
-                day_name = log.get('day', log.get('plan')) # Support old & new schema
+            if log_date >= week_start_day:
+                day_name = log.get('day', log.get('plan'))
                 if day_name: completed_this_week.append(day_name)
         except: continue
-    return completed_this_week
+    return current_week, completed_this_week
 
 def prepare_export_data(history):
     """آماده سازی دیتا برای خروجی مربی با جزییات کامل"""
     export_list = []
     for log in history:
-        # تبدیل دیکشنری وزن‌ها به یک رشته متنی خوانا
         details = ""
         if 'details' in log:
             for ex, w in log['details'].items():
@@ -206,16 +255,9 @@ def generate_program_structure(gender, goal, level):
         structured_plan[day] = day_exs
     return structured_plan
 
-def load_db():
-    if not os.path.exists(DB_FILE): return {}
-    with open(DB_FILE, 'r') as f: return json.load(f)
-
-def save_db(data):
-    with open(DB_FILE, 'w') as f: json.dump(data, f, indent=4)
-
 def init_user(username, password, gender, goal, level):
     db = load_db()
-    if username in db: return False, "نام کاربری تکراری"
+    if username in db: return False, "نام کاربری تکراری است"
     prog = generate_program_structure(gender, goal, level)
     weights = {}
     for day, exs in prog.items():
@@ -293,7 +335,7 @@ p, div, label, li {{ color: #ecf0f1 !important; font-size: 16px; }}
 if 'user' not in st.session_state: st.session_state['user'] = None
 
 if not st.session_state['user']:
-    st.title("🏗️ Gym Architect Pro")
+    st.title("🏗️ Gym Architect Pro (Cloud)")
     t1, t2 = st.tabs(["ورود", "ثبت نام"])
     with t1:
         u = st.text_input("نام کاربری")
@@ -303,7 +345,7 @@ if not st.session_state['user']:
             if u in db and db[u]['password'] == p:
                 st.session_state['user'] = u
                 st.rerun()
-            else: st.error("اطلاعات نادرست")
+            else: st.error("اطلاعات نادرست یا کاربر یافت نشد")
     with t2:
         u_n = st.text_input("نام کاربری جدید")
         p_n = st.text_input("رمز عبور جدید", type="password")
@@ -355,13 +397,13 @@ tab_plan, tab_gym, tab_report = st.tabs(["📅 برنامه و تقویم", "�
 
 # --- TAB 1: WEEKLY PLAN ---
 with tab_plan:
-    st.header("وضعیت هفته جاری")
-    completed = get_weekly_status(udata['history'], 7)
-    days = list(udata['program'].keys())
+    curr_week, completed_days = get_weekly_status(udata['history'], udata['profile']['joined'])
+    st.header(f"هفته {curr_week} از دوره تمرینی")
     
+    days = list(udata['program'].keys())
     cols = st.columns(len(days))
     for i, day in enumerate(days):
-        done = day in completed
+        done = day in completed_days
         color = "#2ecc71" if done else "#34495e"
         icon = "✅ انجام شده" if done else "⬜ تمرین امروز؟"
         with cols[i]:
@@ -391,7 +433,24 @@ with tab_gym:
         # Session Timer Display
         elapsed = int(time.time() - st.session_state['start_time'])
         mins, secs = divmod(elapsed, 60)
-        st.markdown(f"<div class='session-timer'>⏱️ زمان جلسه: {mins:02}:{secs:02}</div>", unsafe_allow_html=True)
+        # JS for live update
+        start_ts = st.session_state['start_time'] * 1000
+        st.markdown(f"""
+        <div id="live_timer" class="session-timer">00:00</div>
+        <script>
+        function updateTimer() {{
+            var start = {start_ts};
+            var now = new Date().getTime();
+            var diff = Math.floor((now - start) / 1000);
+            var m = Math.floor(diff / 60);
+            var s = diff % 60;
+            m = m < 10 ? "0" + m : m;
+            s = s < 10 ? "0" + s : s;
+            document.getElementById("live_timer").innerHTML = "⏱️ " + m + ":" + s;
+        }}
+        setInterval(updateTimer, 1000);
+        </script>
+        """, unsafe_allow_html=True)
         
         day_plan = udata['program'][st.session_state['day']]
         idx = st.session_state['idx']
