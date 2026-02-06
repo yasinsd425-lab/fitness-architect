@@ -1,3 +1,5 @@
 streamlit
-gTTS
 pandas
+gTTS
+gspread
+oauth2client
